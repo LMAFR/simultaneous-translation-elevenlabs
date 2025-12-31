@@ -102,6 +102,8 @@ class ElevenLabsRealtimeSTT:
                                         }
                                     )
                                 )
+                            # Important: close so recv_loop terminates promptly.
+                            await ws.close()
                             break
 
                         uncommitted.extend(frame)

@@ -149,36 +149,53 @@ async def main() -> None:
 
     # Buffers per utterance (collect what we will say)
     pending_say_by_utt: dict[str, str] = {}
+    # Track latest full STT hypothesis per utterance
+    latest_stt_by_utt: dict[str, str] = {}
     ended_utt_q: asyncio.Queue[str] = asyncio.Queue()
+
+    # Track when an STT session for an utterance has finished (queue drained + ws closed)
+    stt_done_evt_by_utt: dict[str, asyncio.Event] = {}
 
     # Debug: count frames per utterance we actually forwarded
     forwarded_frames_by_utt: dict[str, int] = {}
 
     async def stt_consumer_task(utt_id: str, q: "asyncio.Queue[bytes | None]") -> None:
-        """Consumes STT events for a single utterance session and buffers translated text."""
-        prev_partial = ""
+        """Consumes STT events for a single utterance session.
+
+        Keep only the latest full hypothesis.
+        """
+        done_evt = stt_done_evt_by_utt.setdefault(utt_id, asyncio.Event())
         tr_cfg = TranslationConfig(mode=translation_mode, input_lang=input_lang, output_lang=output_lang)
+        last_translated_src = ""
 
-        async for ev in stt.run_one_utterance(q, utt_id):
-            if stop_event.is_set():
-                break
-            if (not ev.is_final) and ev.text:
-                if metrics.get(utt_id).t_partial_transcript_ms is None:
-                    metrics.set_if_none(utt_id, "t_partial_transcript_ms", ev.received_time_ms)
+        try:
+            async for ev in stt.run_one_utterance(q, utt_id):
+                if stop_event.is_set():
+                    break
 
-                delta = chunk_text_delta(prev_partial, ev.text)
-                prev_partial = ev.text
-                if delta:
-                    translated = await translate(delta, tr_cfg)
-                    pending_say_by_utt[utt_id] = (pending_say_by_utt.get(utt_id, "") + " " + translated).strip()
-                    print(f"[{ev.received_time_ms:,.0f} ms] SAY (buffering, not playing yet) ({utt_id}): {translated}")
-                continue
+                if ev.text:
+                    latest_stt_by_utt[utt_id] = ev.text
 
-            if ev.is_final and ev.text:
-                metrics.set_if_none(utt_id, "t_final_transcript_ms", ev.received_time_ms)
-                print(f"[{ev.received_time_ms:,.0f} ms] STT FINAL ({utt_id}): {ev.text}")
-                translated_final = await translate(ev.text, tr_cfg)
-                pending_say_by_utt[utt_id] = (pending_say_by_utt.get(utt_id, "") + " " + translated_final).strip()
+                # Optional: keep the console preview, but do not trust it for final playback.
+                if (not ev.is_final) and ev.text:
+                    if metrics.get(utt_id).t_partial_transcript_ms is None:
+                        metrics.set_if_none(utt_id, "t_partial_transcript_ms", ev.received_time_ms)
+
+                    if ev.text != last_translated_src:
+                        last_translated_src = ev.text
+                        translated = await translate(ev.text, tr_cfg)
+                        pending_say_by_utt[utt_id] = translated.strip()
+                        print(
+                            f"[{ev.received_time_ms:,.0f} ms] SAY (buffering, not playing yet) "
+                            f"({utt_id}): {pending_say_by_utt[utt_id]}"
+                        )
+                    continue
+
+                if ev.is_final and ev.text:
+                    metrics.set_if_none(utt_id, "t_final_transcript_ms", ev.received_time_ms)
+                    latest_stt_by_utt[utt_id] = ev.text
+        finally:
+            done_evt.set()
 
     async def mic_task():
         nonlocal utt_counter, current_utt_id, in_speech, silence_frames, speech_frames_in_utt
@@ -271,19 +288,45 @@ async def main() -> None:
                     pass
 
     async def playback_task():
+        tr_cfg = TranslationConfig(mode=translation_mode, input_lang=input_lang, output_lang=output_lang)
+
+        # Give STT a moment after mic end-of-utterance to finalize the last hypothesis.
+        post_utt_delay_s = float(os.getenv("POST_UTTERANCE_DELAY_S", "1.0"))
+
         while not stop_event.is_set():
             utt_id = await ended_utt_q.get()
-            final_to_say = pending_say_by_utt.get(utt_id, "").strip()
             frames = forwarded_frames_by_utt.get(utt_id, 0)
-            if not final_to_say:
-                print(f"[PLAYBACK] ({utt_id}) No buffered text to speak. (frames_forwarded={frames})")
-                continue
+
+            if post_utt_delay_s > 0:
+                await asyncio.sleep(post_utt_delay_s)
+
+            # Wait for the STT session to finish so we really have the last partial/final.
+            done_evt = stt_done_evt_by_utt.get(utt_id)
+            if done_evt is not None:
+                try:
+                    await asyncio.wait_for(done_evt.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    pass
+
+            # Translate the latest hypothesis at playback time (authoritative).
+            src_text = (latest_stt_by_utt.get(utt_id) or "").strip()
+            if not src_text:
+                # fall back to whatever preview we had
+                src_text = (pending_say_by_utt.get(utt_id) or "").strip()
+                if not src_text:
+                    print(f"[PLAYBACK] ({utt_id}) No buffered text to speak. (frames_forwarded={frames})")
+                    continue
+                final_to_say = src_text
+            else:
+                final_to_say = (await translate(src_text, tr_cfg)).strip()
 
             print(f"[PLAYBACK] SAY FINAL ({utt_id}): {final_to_say}")
             await playback_allowed.wait()
             await speak_streaming(tts, final_to_say, metrics, player, utt_id)
 
             pending_say_by_utt.pop(utt_id, None)
+            latest_stt_by_utt.pop(utt_id, None)
+            stt_done_evt_by_utt.pop(utt_id, None)
             metrics.commit_utterance(utt_id)
             print(metrics.summary_str())
 
