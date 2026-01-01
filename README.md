@@ -31,6 +31,16 @@ You should see logs like:
 - TTS first audio bytes arrived
 - PLAY first audio played + approximate e2e mic→play latency
 
+## Architecture notes (updated)
+
+### STT sessions are per utterance
+This prototype opens a **fresh ElevenLabs realtime STT WebSocket session per utterance** (speech segment).
+This is intentional: in practice, segmenting multiple utterances inside a single long-lived session can stop producing partials after the first commit.
+
+### TTS uses the ElevenLabs Python SDK (preferred)
+The TTS client (`src/elevenlabs_tts.py`) maintains an `async for chunk in tts.stream(text)` interface, but it now **prefers the official ElevenLabs Python SDK** when installed.
+If the SDK is unavailable or fails, it falls back to the HTTP streaming endpoint.
+
 ### Environment variables
 - `ELEVENLABS_API_KEY` (required)
 - `ELEVENLABS_VOICE_ID` (optional; defaults to a commonly-available voice)
@@ -40,6 +50,11 @@ You should see logs like:
   - `none`: echoes text
   - `dummy`: tiny placeholder translation (no extra keys)
   - `openai`: uses `OPENAI_API_KEY` if present; otherwise falls back to echo
+
+Optional tuning:
+- `OUTPUT_DEVICE`: integer output device index for sounddevice
+- `TTS_PREBUFFER_MS`: jitter buffer prebuffer for playback
+- `TTS_DRAIN_SECONDS`: how long the smoke test waits before exiting
 
 ### Using OpenAI only for translation
 Set:
@@ -51,7 +66,8 @@ Pipeline:
 
 If `OPENAI_API_KEY` is missing, the code will automatically fall back to echoing the original text so the loop still runs.
 
-### Notes / troubleshooting
+## Troubleshooting
+
 - **Echo/feedback:** use headphones, reduce speaker volume, and/or lower mic gain.
 - **Latency tuning:**
   - Smaller `block_ms` (e.g. 10–20ms) can help, but may increase CPU overhead.
@@ -60,3 +76,5 @@ If `OPENAI_API_KEY` is missing, the code will automatically fall back to echoing
   If STT doesn’t connect or parse results, edit `src/elevenlabs_stt.py` only.
 - **Audio format:** TTS requests `pcm_16000` for simplest streaming playback.
   If your account doesn’t support PCM streaming, switch to mp3 output and add a decoder.
+- **Truncated TTS audio (only first word/syllables):** this can happen if your ElevenLabs account/API key has **insufficient credits** or is rate-limited.
+  Verify your credit balance and re-run the smoke test.
